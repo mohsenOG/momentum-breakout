@@ -14,7 +14,7 @@ python main_test.py
 
 A virtual environment is optional. To use one, run `python -m venv .venv` from the repository root and activate it before installing dependencies. Use `.\.venv\Scripts\Activate.ps1` in PowerShell or `source .venv/bin/activate` in a POSIX shell.
 
-From the repository root, `python -m backtest.main_test` also launches the menu. Run `python -m backtest.smoke_test` there to check the full offline workflow.
+From the repository root, `python -m backtest.main_test` also launches the menu.
 
 - Choose **1** to enter inclusive start and end dates in UTC. The downloader fetches the four candle series, KuCoin Futures settlements when enabled, and contract metadata. It includes prior candles for indicator warm-up and requires every candle in the requested range.
 - Choose **2** to select a saved period. The replay only reads local files. A missing candle, insufficient warm-up, or incomplete required funding stops the run with an error. Keep the date-stamped folder under `backtest/history/` with its canonical CSVs, `manifest.json`, and `contract.json`. Option 1 reuses a compatible folder when it covers the full request.
