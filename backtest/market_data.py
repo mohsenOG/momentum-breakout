@@ -29,6 +29,7 @@ MILLISECOND = pd.Timedelta(milliseconds=1)
 CANDLE_COLUMNS = ("open", "high", "low", "close", "volume")
 CACHE_VERSION = 1
 KUCOIN_FUTURES = "https://api-futures.kucoin.com"
+KUCOIN_UTA_KLINES = "https://api.kucoin.com/api/ua/v2/market/kline"
 CONTRACT_URL = KUCOIN_FUTURES + "/api/v1/contracts/{symbol}"
 FUNDING_URL = KUCOIN_FUTURES + "/api/v1/contract/funding-rates"
 Progress = Callable[[str], None]
@@ -250,6 +251,17 @@ def validate_candles(
     return frame.loc[expected]
 
 
+def missing_ranges(missing: pd.DatetimeIndex, step: pd.Timedelta):
+    if len(missing):
+        start = previous = missing[0]
+        for timestamp in missing[1:]:
+            if timestamp != previous + step:
+                yield start, previous + step
+                start = timestamp
+            previous = timestamp
+        yield start, previous + step
+
+
 def millis(timestamp: pd.Timestamp) -> int:
     return (timestamp - pd.Timestamp(0, tz="UTC")) // MILLISECOND
 
@@ -288,6 +300,34 @@ def kucoin_futures_page(api: PublicAPI, url: str, symbol: str, start: pd.Timesta
     return [row[:6] for row in rows]
 
 
+def kucoin_uta_futures_5m(
+    api: PublicAPI, symbol: str, start: pd.Timestamp, end: pd.Timestamp, classic_volume: pd.Series,
+) -> pd.DataFrame:
+    data = api.get(KUCOIN_UTA_KLINES, {
+        "symbol": symbol, "tradeType": "FUTURES", "klineType": "TRADE", "interval": "5min",
+        "startAt": millis(start) // 1000, "endAt": millis(end) // 1000 - 1,
+    }, kucoin=True)
+    if not isinstance(data, dict) or (
+        data.get("symbol"), data.get("tradeType"), data.get("klineType")
+    ) != (symbol, "FUTURES", "TRADE"):
+        raise DataError(f"KuCoin UTA V2: expected {symbol} Futures trade candles.")
+    rows = data.get("list")
+    if not isinstance(rows, list) or any(not isinstance(row, list) or len(row) < 6 for row in rows):
+        raise DataError("KuCoin UTA V2: invalid Futures candle schema.")
+    frame = numeric_frame(
+        [row[:6] for row in rows], CANDLE_COLUMNS, f"KuCoin UTA V2 {symbol} 5m",
+        unit="s", interval=FIVE_MINUTES,
+    )
+    # UTA V2 reports twice the Classic volume, verified against KuCoin's trade archive.
+    overlap = classic_volume.reindex(frame.index).dropna()
+    reported = frame.loc[overlap.index, "volume"]
+    if np.allclose(reported, 2 * overlap, rtol=1e-9, atol=0):
+        return frame.assign(volume=frame["volume"] / 2)
+    if np.allclose(reported, overlap, rtol=1e-9, atol=0):
+        return frame
+    raise DataError("KuCoin UTA V2: volumes disagree with Classic on overlapping candles.")
+
+
 MARKETS = {
     "binance_spot": ("https://data-api.binance.vision/api/v3/klines", 1000, "ms", binance_page),
     "binance_futures": ("https://fapi.binance.com/fapi/v1/klines", 1500, "ms", binance_page),
@@ -297,21 +337,108 @@ MARKETS = {
 }
 
 
+def recover_kucoin_futures_5m(
+    api: PublicAPI, symbol: str, frame: pd.DataFrame, expected: pd.DatetimeIndex,
+    fetch_classic: Callable[[pd.Timestamp, pd.Timestamp], pd.DataFrame],
+) -> pd.DataFrame:
+    step = FIVE_MINUTES
+    first, stop = expected[0], expected[-1] + step
+    # At most four hours of missing candles per request, plus adjacent bars.
+    span = min(48, max(1, len(expected) - 2)) * step
+    for name, fetch in (
+        ("KuCoin Classic", fetch_classic),
+        ("KuCoin UTA V2", lambda start, end: kucoin_uta_futures_5m(api, symbol, start, end, frame["volume"])),
+    ):
+        missing = expected.difference(frame.index)
+        for gap_start, gap_end in missing_ranges(missing, step):
+            for left, right in time_pages(gap_start, gap_end, span):
+                query_start = max(first, left - step)
+                query_end = min(stop, right + step)
+                if query_start == first and query_end == stop:
+                    if left > first:
+                        query_start = left
+                    elif right < stop:
+                        query_end = right
+                api.progress(f"Retrying {symbol} 5m gap {left} through {right - step} via {name}.")
+                try:
+                    recovered = fetch(query_start, query_end)
+                    if ((recovered.index < query_start) | (recovered.index >= query_end)).any():
+                        raise DataError("Candle timestamps fall outside the requested interval.")
+                except DataError as error:
+                    api.progress(f"  {name} could not recover the gap: {error}")
+                    continue
+                # Overlap is for the request only. Preserve already validated rows.
+                rows = recovered.loc[recovered.index.isin(missing) & (recovered.index >= left) & (recovered.index < right)]
+                if not rows.empty:
+                    frame = pd.concat((frame, rows)).sort_index()
+    return frame
+
+
+def save_candle_page(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".page-", dir=path.parent) as staging:
+        temporary = Path(staging) / path.name
+        frame.to_csv(temporary, index_label="timestamp_utc")
+        temporary.replace(path)
+
+
 def download_candles(
     api: PublicAPI, market: str, symbol: str, start: pd.Timestamp, end: pd.Timestamp, timeframe: str,
 ) -> pd.DataFrame:
     url, limit, unit, fetch = MARKETS[market]
     step = INTERVALS[timeframe]
     source = f"{market} {symbol} {timeframe}"
-    parts = []
-    for first, stop in time_pages(start, end, limit * step):
-        api.progress(f"Downloading {source} from {first} through {stop - step}.")
+    recover_gaps = market == "kucoin_futures" and timeframe == "5m"
+    directory = api.settings.data_directory / ".pages" / market / symbol / timeframe
+
+    def fetch_frame(first: pd.Timestamp, stop: pd.Timestamp) -> pd.DataFrame:
         try:
             rows = fetch(api, url, symbol, first, stop, timeframe)
         except (TypeError, ValueError, OverflowError) as error:
             raise DataError(f"{source} at {first}: {error}") from error
-        frame = numeric_frame(rows, CANDLE_COLUMNS, source, unit=unit, interval=step)
-        parts.append(validate_candles(frame, first, stop, source, step))
+        return numeric_frame(rows, CANDLE_COLUMNS, source, unit=unit, interval=step)
+
+    parts = []
+    for first, stop in time_pages(start, end, limit * step):
+        expected = pd.date_range(first, stop, freq=step, inclusive="left", name="timestamp_utc")
+        path = directory / f"{millis(first)}_{millis(stop)}.csv"
+        partial = path.with_suffix(".partial.csv")
+        frame = None
+        complete_from_cache = False
+        if api.settings.cache_enabled:
+            for candidate in (path, partial) if recover_gaps else (path,):
+                if candidate.is_file():
+                    try:
+                        cached = read_csv(candidate, CANDLE_COLUMNS, step=step)
+                        if not cached.index.isin(expected).all() or cached.empty:
+                            raise DataError("Unexpected candle timestamps in the page cache.")
+                        if candidate == path:
+                            cached = validate_candles(cached, first, stop, source, step)
+                    except DataError as error:
+                        api.progress(f"Skipping cached page {candidate.name}: {error}")
+                    else:
+                        frame = cached
+                        complete_from_cache = candidate == path
+                        api.progress(
+                            f"Resuming {source} from {first} through {stop - step} "
+                            f"({len(frame)}/{len(expected)} candles cached)."
+                        )
+                        break
+        if frame is None:
+            api.progress(f"Downloading {source} from {first} through {stop - step}.")
+            downloaded = fetch_frame(first, stop)
+            frame = downloaded.loc[downloaded.index.isin(expected)]
+            if api.settings.cache_enabled and recover_gaps and 0 < len(frame) < len(expected):
+                save_candle_page(partial, frame)
+        if recover_gaps and len(frame) < len(expected):
+            original_count = len(frame)
+            frame = recover_kucoin_futures_5m(api, symbol, frame, expected, fetch_frame)
+            if api.settings.cache_enabled and original_count < len(frame) < len(expected):
+                save_candle_page(partial, frame)
+        page = validate_candles(frame, first, stop, source, step)
+        if api.settings.cache_enabled and not complete_from_cache:
+            save_candle_page(path, page)
+        parts.append(page)
     return pd.concat(parts)
 
 
