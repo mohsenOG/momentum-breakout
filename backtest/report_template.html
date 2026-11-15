@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ symbol }} Momentum Breakout Backtest</title>
+<style>
+  :root { color-scheme:dark; font-family:Inter,system-ui,sans-serif; background:#0b1220; color:#e8eff9; }
+  body { margin:0; }
+  main { max-width:1350px; margin:auto; padding:36px 28px 56px; }
+  header { margin-bottom:25px; }
+  h1 { font-size:clamp(1.7rem,4vw,2.65rem); margin:6px 0 8px; letter-spacing:-.04em; }
+  h2 { font-size:1.25rem; font-weight:620; margin:0 0 15px; }
+  h3 { font-size:1rem; margin:0 0 3px; }
+  p { margin:6px 0; }
+  .muted, dt { color:#aebfd6; }
+  .panel { background:#111a29; border:1px solid #26364c; border-radius:12px; padding:18px; margin:0 0 18px; }
+  .facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:16px; margin:0; }
+  dt { font-size:.81rem; margin-bottom:4px; }
+  dd { margin:0; font-weight:550; }
+  .scroll { overflow:auto; }
+  table { width:100%; border-collapse:collapse; font-size:.88rem; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; white-space:nowrap; padding:9px 10px; border-bottom:1px solid #28364c; }
+  thead th { color:#b9cce4; background:#172338; }
+  tbody tr:nth-child(even) { background:#142033; }
+  tbody tr:hover { background:#1a2a41; }
+  tbody th { font-weight:540; }
+  td.num, th.num { text-align:right; }
+  .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,500px),1fr)); gap:18px; }
+  .chart { min-width:0; }
+  .toolbar { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:12px; }
+  label { font-size:.87rem; color:#c9d7eb; }
+  input { margin-left:6px; padding:7px 10px; border:1px solid #49617e; border-radius:5px; background:#0b1220; color:inherit; }
+  @media(max-width:550px) { main { padding:20px 12px 32px; } .panel { padding:12px; } }
+</style>
+<script>{{ plotly_js | safe }}</script>
+</head>
+<body>
+<main>
+  <header>
+    <p class="muted">{{ symbol }} · KuCoin Futures {{ contract }}</p>
+    <h1>Momentum Breakout Backtest</h1>
+    <p class="muted">Generated {{ created }} UTC</p>
+  </header>
+
+  <section class="panel" aria-label="Run settings">
+    <dl class="facts">
+    {% for label, value in settings.items() %}
+      <div><dt>{{ label }}</dt><dd>{{ value }}</dd></div>
+    {% endfor %}
+    </dl>
+  </section>
+
+  <section class="panel">
+    <h2>Strategy performance</h2>
+    <div class="scroll">
+      <table aria-label="Strategy performance">
+        <thead><tr><th scope="col">Metric</th>{% for summary in summaries %}<th class="num" scope="col">{{ names[summary.strategy] }}</th>{% endfor %}</tr></thead>
+        <tbody>
+        {% for key, label, kind in metrics %}
+          <tr><th scope="row">{{ label }}</th>{% for summary in summaries %}<td class="num">{{ summary[key] | display(kind) }}</td>{% endfor %}</tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="charts">
+    {% for label, chart in charts %}
+    <section class="panel chart"><h3>{{ label }}</h3>{{ chart | safe }}</section>
+    {% endfor %}
+  </div>
+
+  <section class="panel" aria-labelledby="trades-heading">
+    <h2 id="trades-heading">Trade history</h2>
+    {% if trades %}
+    <div class="toolbar">
+      <label>Filter trades <input type="search" id="trade-filter" aria-controls="trade-history"></label>
+      <span class="muted" id="trade-count" aria-live="polite">{{ trades | length }} trades</span>
+    </div>
+    <div class="scroll" tabindex="0" aria-label="Scrollable trade history">
+      <table id="trade-history">
+        <thead><tr>
+          {% for heading in ["Trade ID", "Strategy", "Side", "Signal (UTC)", "Entry (UTC)", "Exit (UTC)", "Entry price", "Exit price", "Contracts", "Leverage", "Gross P&L", "Fees", "Funding", "Net P&L", "Unrealized P&L", "Exit reason"] %}
+          <th scope="col">{{ heading }}</th>
+          {% endfor %}
+        </tr></thead>
+        <tbody>
+        {% for trade in trades %}
+          <tr>
+            <th scope="row">{{ trade.trade_id }}</th>
+            <td>{{ names[trade.strategy] }}</td><td>{{ trade.side }}</td>
+            <td>{{ trade.signal_timestamp | utc }}</td><td>{{ trade.entry_timestamp | utc }}</td><td>{{ trade.exit_timestamp | utc }}</td>
+            <td class="num">{{ trade.entry_price | display }}</td><td class="num">{{ trade.exit_price | display }}</td>
+            <td class="num">{{ trade.contract_quantity | display("integer") }}</td><td class="num">{{ trade.leverage }}×</td>
+            <td class="num">{{ trade.gross_pnl | display }}</td><td class="num">{{ (trade.entry_fee + trade.exit_fee) | display }}</td>
+            <td class="num">{{ trade.funding_pnl | display }}</td><td class="num">{{ trade.net_pnl | display }}</td>
+            <td class="num">{{ trade.unrealized_pnl | display if not trade.exit_timestamp else "—" }}</td>
+            <td>{{ trade.exit_reason or "OPEN" }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<p class="muted">No trades were filled in this period.</p>{% endif %}
+  </section>
+
+  {% if rejected %}
+  <section class="panel">
+    <h2>Rejected entries</h2>
+    <div class="scroll">
+      <table aria-label="Rejected entries">
+        <thead><tr><th scope="col">Strategy</th><th scope="col">Signal (UTC)</th><th scope="col">Side</th><th scope="col">Breakout level</th><th scope="col">Reason</th></tr></thead>
+        <tbody>
+        {% for signal in rejected %}
+          <tr><td>{{ names[signal.strategy] }}</td><td>{{ signal.signal_timestamp | utc }}</td><td>{{ signal.side }}</td>
+          <td class="num">{{ signal.breakout_level | display }}</td><td>{{ signal.rejection_reason }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+</main>
+{% if trades %}
+<script>
+  const filter = document.getElementById('trade-filter');
+  const rows = [...document.querySelectorAll('#trade-history tbody tr')];
+  const count = document.getElementById('trade-count');
+  filter.addEventListener('input', () => {
+    const query = filter.value.trim().toLowerCase();
+    let visible = 0;
+    for (const row of rows) {
+      row.hidden = !row.textContent.toLowerCase().includes(query);
+      visible += Number(!row.hidden);
+    }
+    count.textContent = visible + ' of ' + rows.length + ' trades';
+  });
+</script>
+{% endif %}
+</body>
+</html>

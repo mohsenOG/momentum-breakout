@@ -1,0 +1,485 @@
+"""Download, validate, and cache public exchange history."""
+
+from dataclasses import dataclass
+from datetime import date, timedelta
+from email.utils import parsedate_to_datetime
+from hashlib import sha256
+import json
+from math import isfinite
+from pathlib import Path
+import re
+from tempfile import TemporaryDirectory
+from time import sleep
+from typing import Callable
+from uuid import uuid4
+
+import numpy as np
+import pandas as pd
+import requests
+
+from .config_test import AccountSettings, Config, MarketSettings
+
+
+HOUR = pd.Timedelta(hours=1)
+DAY = pd.Timedelta(days=1)
+MILLISECOND = pd.Timedelta(milliseconds=1)
+CANDLE_COLUMNS = ("open", "high", "low", "close", "volume")
+CACHE_VERSION = 1
+KUCOIN_FUTURES = "https://api-futures.kucoin.com"
+CONTRACT_URL = KUCOIN_FUTURES + "/api/v1/contracts/{symbol}"
+FUNDING_URL = KUCOIN_FUTURES + "/api/v1/contract/funding-rates"
+Progress = Callable[[str], None]
+
+
+class DataError(ValueError):
+    """Required history is unavailable, incomplete, or invalid."""
+
+
+@dataclass(frozen=True)
+class Period:
+    start: pd.Timestamp
+    end: pd.Timestamp  # Exclusive UTC boundary.
+
+    @classmethod
+    def from_dates(cls, first: str, last: str) -> "Period":
+        if not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in (first, last)):
+            raise DataError("Use YYYY-MM-DD for both dates.")
+        start = pd.Timestamp(date.fromisoformat(first), tz="UTC")
+        end = pd.Timestamp(date.fromisoformat(last) + timedelta(days=1), tz="UTC")
+        period = cls(start, end)
+        period.validate()
+        return period
+
+    def validate(self) -> None:
+        if any(str(value.tz) != "UTC" or value != value.floor("h") for value in (self.start, self.end)):
+            raise DataError("Period boundaries must be UTC hours.")
+        if self.end <= self.start:
+            raise DataError("The end date must be on or after the start date.")
+        if self.end > pd.Timestamp.now(tz="UTC").floor("h"):
+            raise DataError("The period includes an unfinished or future UTC candle.")
+
+    @property
+    def last_date(self) -> date:
+        return (self.end - HOUR).date()
+
+
+@dataclass(frozen=True)
+class Contract:
+    symbol: str
+    multiplier: float
+    lot_size: int
+    minimum_order_quantity: int
+    tick_size: float
+    initial_margin_rate: float
+    maintenance_margin_rate: float
+    max_leverage: float
+    market_max_order_quantity: int
+
+    @classmethod
+    def from_metadata(cls, raw: dict, symbol: str, settings: AccountSettings) -> "Contract":
+        def quantity(value) -> int:
+            number = int(value)
+            if number != float(value) or number < 1:
+                raise ValueError("Invalid contract quantity increment or limit.")
+            return number
+
+        try:
+            if raw["symbol"] != symbol or raw["isInverse"] is not False or raw["settleCurrency"] != "USDT":
+                raise ValueError("A matching linear USDT-settled contract is required.")
+            lot = quantity(settings.lot_size or raw["lotSize"])
+            minimum = quantity(settings.minimum_order_quantity or raw.get("minOrderQty") or lot)
+            contract = cls(
+                symbol, float(settings.contract_multiplier or raw["multiplier"]), lot,
+                minimum, float(settings.tick_size or raw["tickSize"]),
+                float(raw["initialMargin"]),
+                float(raw["maintainMargin"] if settings.maintenance_margin_rate is None
+                      else settings.maintenance_margin_rate),
+                float(raw["maxLeverage"]), quantity(raw["marketMaxOrderQty"]),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise DataError(f"Invalid KuCoin Futures metadata for {symbol}: {error}") from error
+        if (
+            not all(isfinite(value) and value > 0 for value in
+                    (contract.multiplier, contract.tick_size, contract.max_leverage))
+            or not 0 <= contract.maintenance_margin_rate < 1
+            or not 0 < contract.initial_margin_rate <= 1
+            or max(lot, minimum) > contract.market_max_order_quantity
+        ):
+            raise DataError(f"Invalid KuCoin Futures trading limits for {symbol}.")
+        if settings.leverage > contract.max_leverage:
+            raise DataError(f"Configured leverage exceeds KuCoin's limit of {contract.max_leverage:g}.")
+        return contract
+
+
+@dataclass(frozen=True)
+class History:
+    period: Period
+    candles: dict[str, pd.DataFrame]
+    funding: pd.Series
+    contract: Contract
+    source: Path
+    metadata_fetched_at: str
+    cached_period: Period
+    cached_candle_start: pd.Timestamp
+
+
+@dataclass(frozen=True)
+class CachedPeriod:
+    path: Path
+    period: Period
+    candle_start: pd.Timestamp
+    has_funding: bool
+
+
+def time_pages(start: pd.Timestamp, end: pd.Timestamp, span: pd.Timedelta):
+    while start < end:
+        stop = min(start + span, end)
+        yield start, stop
+        start = stop
+
+
+def retry_delay(response: requests.Response) -> float:
+    header = response.headers.get("Retry-After")
+    try:
+        if header:
+            try:
+                return float(header)
+            except ValueError:
+                return max(0, (pd.Timestamp(parsedate_to_datetime(header)) - pd.Timestamp.now(tz="UTC")).total_seconds())
+        return float(response.headers.get("gw-ratelimit-reset", 0)) / 1000
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+class PublicAPI:
+    def __init__(self, session: requests.Session, settings: MarketSettings, progress: Progress):
+        self.session, self.settings, self.progress = session, settings, progress
+
+    def get(self, url: str, params: dict, *, kucoin: bool = False):
+        delay = self.settings.retry_backoff
+        for attempt in range(self.settings.retry_count + 1):
+            wait = delay
+            try:
+                with self.session.get(url, params=params, timeout=self.settings.request_timeout) as response:
+                    status = response.status_code
+                    if status in (408, 418, 425, 429) or 500 <= status < 600:
+                        failure = f"HTTP {status}"
+                        wait = max(wait, retry_delay(response))
+                    elif not response.ok:
+                        detail = response.text[:240].strip().replace("\n", " ")
+                        raise DataError(f"{url}: HTTP {status} {detail}")
+                    else:
+                        try:
+                            payload = response.json()
+                        except ValueError as error:
+                            raise DataError(f"{url}: invalid JSON response.") from error
+                        if not kucoin:
+                            if not isinstance(payload, list):
+                                raise DataError(f"{url}: expected a Binance row list, got {str(payload)[:240]}.")
+                            return payload
+                        if not isinstance(payload, dict):
+                            raise DataError(f"{url}: invalid KuCoin response envelope.")
+                        code = str(payload.get("code"))
+                        if code == "200000" and "data" in payload:
+                            return payload["data"]
+                        if code not in ("429000", "200002", "500000"):
+                            raise DataError(f"{url}: KuCoin error {code} {payload.get('msg', '')}")
+                        failure = f"KuCoin error {code}"
+                        wait = max(wait, retry_delay(response))
+            except requests.RequestException as error:
+                failure = str(error)
+            if attempt == self.settings.retry_count or wait > self.settings.retry_max_delay:
+                raise DataError(f"{url}: {failure}; request could not complete within retry settings.")
+            self.progress(f"  {failure}. Retrying {url} in {wait:g}s.")
+            sleep(wait)
+            delay = min(delay * 2, self.settings.retry_max_delay)
+
+
+def candle_frame(rows, source: str, *, unit: str | None = None) -> pd.DataFrame:
+    return numeric_frame(rows, CANDLE_COLUMNS, source, unit=unit)
+
+
+def numeric_frame(rows, columns, source: str, *, unit: str | None = None) -> pd.DataFrame:
+    frame = pd.DataFrame(rows, columns=("timestamp_utc", *columns))
+    try:
+        timestamps = frame.pop("timestamp_utc")
+        if unit:
+            numeric = pd.to_numeric(timestamps)
+            if not np.isfinite(numeric).all() or (numeric % 1 != 0).any():
+                raise ValueError("Nonintegral exchange timestamp.")
+            timestamps = pd.to_datetime(numeric, unit=unit, utc=True, errors="raise")
+        else:
+            timestamps = pd.to_datetime(timestamps, utc=True, errors="raise", format="ISO8601")
+        frame.index = pd.DatetimeIndex(timestamps, name="timestamp_utc")
+        frame = frame.apply(pd.to_numeric, errors="raise").astype(float)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise DataError(f"{source}: invalid timestamp or numeric value: {error}") from error
+    if frame.index.hasnans or not np.isfinite(frame.to_numpy()).all():
+        raise DataError(f"{source}: missing or non-finite observation.")
+    frame = frame.reset_index().drop_duplicates().set_index("timestamp_utc").sort_index()
+    if frame.index.has_duplicates:
+        duplicate = frame.index[frame.index.duplicated()][0]
+        raise DataError(f"{source}: conflicting observations at {duplicate}.")
+    if columns == CANDLE_COLUMNS:
+        if (
+            (frame.index != frame.index.floor("h")).any()
+            or (frame[["open", "low", "high", "close"]] <= 0).any().any()
+            or (frame["volume"] < 0).any()
+            or (frame["high"] < frame[["open", "low", "close"]].max(axis=1)).any()
+            or (frame["low"] > frame[["open", "high", "close"]].min(axis=1)).any()
+        ):
+            raise DataError(f"{source}: invalid hourly timestamp or OHLCV values.")
+    return frame
+
+
+def validate_candles(frame: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, source: str) -> pd.DataFrame:
+    expected = pd.date_range(start, end, freq="h", inclusive="left", name="timestamp_utc")
+    missing = expected.difference(frame.index)
+    if len(missing):
+        dates = ", ".join(str(value) for value in missing[:3])
+        raise DataError(f"{source}: missing {len(missing)} of {len(expected)} required candles, starting at {dates}.")
+    return frame.loc[expected]
+
+
+def millis(timestamp: pd.Timestamp) -> int:
+    return (timestamp - pd.Timestamp(0, tz="UTC")) // MILLISECOND
+
+
+def binance_page(api: PublicAPI, url: str, symbol: str, start: pd.Timestamp, end: pd.Timestamp):
+    rows = api.get(url, {
+        "symbol": symbol, "interval": "1h", "startTime": millis(start),
+        "endTime": millis(end) - 1, "limit": (end - start) // HOUR,
+    })
+    result = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 7 or int(row[6]) != int(row[0]) + 3_599_999:
+            raise DataError(f"{url}: invalid Binance hourly candle schema or close time.")
+        result.append(row[:6])
+    return result
+
+
+def kucoin_spot_page(api: PublicAPI, url: str, symbol: str, start: pd.Timestamp, end: pd.Timestamp):
+    rows = api.get(url, {
+        "symbol": symbol, "type": "1hour", "startAt": millis(start) // 1000, "endAt": millis(end) // 1000 - 1,
+    }, kucoin=True)
+    if not isinstance(rows, list) or any(not isinstance(row, list) or len(row) < 7 for row in rows):
+        raise DataError(f"{url}: invalid KuCoin Spot candle schema.")
+    return [(row[0], row[1], row[3], row[4], row[2], row[5]) for row in rows]
+
+
+def kucoin_futures_page(api: PublicAPI, url: str, symbol: str, start: pd.Timestamp, end: pd.Timestamp):
+    rows = api.get(url, {
+        "symbol": symbol, "granularity": 60, "from": millis(start), "to": millis(end) - 1,
+    }, kucoin=True)
+    if not isinstance(rows, list) or any(not isinstance(row, list) or len(row) < 6 for row in rows):
+        raise DataError(f"{url}: invalid KuCoin Futures candle schema.")
+    return [row[:6] for row in rows]
+
+
+MARKETS = {
+    "binance_spot": ("https://data-api.binance.vision/api/v3/klines", 1000, "ms", binance_page),
+    "binance_futures": ("https://fapi.binance.com/fapi/v1/klines", 1500, "ms", binance_page),
+    "kucoin_spot": ("https://api.kucoin.com/api/v1/market/candles", 1500, "s", kucoin_spot_page),
+    # The classic endpoint returned at most 200 rows per request in the public API check.
+    "kucoin_futures": (KUCOIN_FUTURES + "/api/v1/kline/query", 200, "ms", kucoin_futures_page),
+}
+
+
+def download_candles(api: PublicAPI, market: str, symbol: str, start: pd.Timestamp, end: pd.Timestamp):
+    url, limit, unit, fetch = MARKETS[market]
+    parts = []
+    for first, stop in time_pages(start, end, limit * HOUR):
+        api.progress(f"Downloading {market} {symbol} from {first} through {stop - HOUR}.")
+        try:
+            rows = fetch(api, url, symbol, first, stop)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise DataError(f"{market} {symbol} at {first}: {error}") from error
+        parts.append(validate_candles(candle_frame(rows, market, unit=unit), first, stop, market))
+    return pd.concat(parts)
+
+
+def validate_funding(funding: pd.Series, period: Period, max_gap_hours: int) -> pd.Series:
+    funding = funding.loc[(funding.index >= period.start) & (funding.index < period.end)]
+    timestamps = [period.start, *funding.index, period.end]
+    for previous, current in zip(timestamps, timestamps[1:]):
+        if current - previous > max_gap_hours * HOUR:
+            raise DataError(f"KuCoin Futures funding history has a gap from {previous} to {current}.")
+    if funding.empty:
+        raise DataError("KuCoin Futures returned no funding settlements for this period.")
+    return funding
+
+
+def download_funding(api: PublicAPI, symbol: str, period: Period, max_gap_hours: int) -> pd.Series:
+    rows = []
+    # One day keeps every documented cadence below the response size, including hourly settlements.
+    for first, stop in time_pages(period.start, period.end, DAY):
+        api.progress(f"Downloading KuCoin Futures funding for {symbol} on {first.date()}.")
+        page = api.get(FUNDING_URL, {
+            "symbol": symbol, "from": millis(first), "to": millis(stop) - 1,
+        }, kucoin=True)
+        try:
+            if not isinstance(page, list) or any(row["symbol"] != symbol for row in page):
+                raise ValueError("Unexpected funding schema or contract.")
+            rows.extend((row["timepoint"], row["fundingRate"]) for row in page)
+        except (TypeError, KeyError, ValueError) as error:
+            raise DataError(f"KuCoin Futures funding at {first}: {error}") from error
+    funding = numeric_frame(rows, ("funding_rate",), "KuCoin Futures funding", unit="ms")["funding_rate"]
+    return validate_funding(funding, period, max_gap_hours)
+
+
+def write_json(path: Path, value: dict) -> None:
+    path.write_text(json.dumps(value, indent=2, default=str, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def read_json(path: Path) -> dict:
+    try:
+        content = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(content, dict):
+            raise ValueError("Expected a JSON object.")
+        return content
+    except (OSError, ValueError) as error:
+        raise DataError(f"{path}: {error}") from error
+
+
+def read_manifest(path: Path, config: Config) -> tuple[CachedPeriod, dict]:
+    manifest = read_json(path / "manifest.json")
+    if (
+        manifest.get("version") != CACHE_VERSION or manifest.get("symbols") != config.market.symbols
+        or manifest.get("timeframe") != config.market.timeframe
+    ):
+        raise DataError(f"{path.name}: cache version, timeframe, or symbols do not match the configuration.")
+    try:
+        period = Period(pd.Timestamp(manifest["start"]), pd.Timestamp(manifest["end"]))
+        period.validate()
+        candle_start = pd.Timestamp(manifest["candle_start"])
+        if str(candle_start.tz) != "UTC" or candle_start != candle_start.floor("h") or candle_start > period.start:
+            raise ValueError("Invalid warm-up start.")
+        has_funding = bool(manifest.get("funding_sha256"))
+    except (KeyError, TypeError, ValueError) as error:
+        raise DataError(f"{path.name}: invalid cache coverage: {error}") from error
+    return CachedPeriod(path, period, candle_start, has_funding), manifest
+
+
+def discover_cache(config: Config, progress: Progress = print) -> list[CachedPeriod]:
+    choices = []
+    for manifest in sorted(config.market.data_directory.glob("*/manifest.json"), reverse=True):
+        try:
+            choice, _ = read_manifest(manifest.parent, config)
+        except DataError as error:
+            progress(f"Skipping cache: {error}")
+        else:
+            choices.append(choice)
+    return choices
+
+
+def read_csv(path: Path, columns) -> pd.DataFrame:
+    try:
+        frame = pd.read_csv(path, float_precision="round_trip")
+        if tuple(frame.columns) != ("timestamp_utc", *columns):
+            raise ValueError("CSV columns do not match the canonical format.")
+        return numeric_frame(frame.itertuples(index=False, name=None), columns, str(path))
+    except (OSError, ValueError) as error:
+        raise DataError(f"{path}: {error}") from error
+
+
+def load_history(path: Path, config: Config, period: Period | None = None) -> History:
+    cached, manifest = read_manifest(path, config)
+    period = period or cached.period
+    period.validate()
+    start = period.start - config.strategy.warmup_hours * HOUR
+    if period.start < cached.period.start or period.end > cached.period.end or start < cached.candle_start:
+        raise DataError(
+            f"{path.name}: cache must cover {period.start} to {period.end} (exclusive), "
+            f"plus {config.strategy.warmup_hours} hours of warm-up from {start}."
+        )
+    candles = {
+        market: validate_candles(read_csv(path / f"{market}.csv", CANDLE_COLUMNS), start, period.end, market)
+        for market in MARKETS
+    }
+    metadata = read_json(path / "contract.json")
+    raw = metadata.get("exchange_metadata")
+    if not isinstance(raw, dict) or not metadata.get("fetched_at"):
+        raise DataError(f"{path.name}: missing contract metadata or metadata timestamp.")
+    contract = Contract.from_metadata(raw, config.market.kucoin_futures_symbol, config.account)
+    funding = pd.Series(dtype=float, name="funding_rate", index=pd.DatetimeIndex([], tz="UTC"))
+    if config.account.funding_enabled:
+        funding_path = path / "funding.csv"
+        if not cached.has_funding:
+            raise DataError(f"{path.name}: no historical funding was downloaded for this cache.")
+        try:
+            digest = sha256(funding_path.read_bytes()).hexdigest()
+        except OSError as error:
+            raise DataError(f"Cannot read cached funding at {funding_path}: {error}") from error
+        if digest != manifest["funding_sha256"]:
+            raise DataError(f"{path.name}: cached funding file differs from the validated download.")
+        rates = read_csv(funding_path, ("funding_rate",))["funding_rate"]
+        funding = validate_funding(rates, period, config.account.max_funding_gap_hours)
+    return History(period, candles, funding, contract, path, metadata["fetched_at"], cached.period, cached.candle_start)
+
+
+def save_history(
+    config: Config, period: Period, candle_start: pd.Timestamp, candles: dict[str, pd.DataFrame],
+    funding: pd.Series | None, metadata: dict,
+) -> Path:
+    root = config.market.data_directory
+    root.mkdir(parents=True, exist_ok=True)
+    name = f"{period.start.date()}_{period.last_date}_{uuid4().hex[:8]}"
+    destination = root / name
+    with TemporaryDirectory(prefix=".download-", dir=root) as staging:
+        directory = Path(staging) / name
+        directory.mkdir()
+        for market, frame in candles.items():
+            frame.to_csv(directory / f"{market}.csv", index_label="timestamp_utc")
+        digest = None
+        if funding is not None:
+            funding_path = directory / "funding.csv"
+            funding.to_csv(funding_path, index_label="timestamp_utc", header=True)
+            digest = sha256(funding_path.read_bytes()).hexdigest()
+        write_json(directory / "contract.json", metadata)
+        write_json(directory / "manifest.json", {
+            "version": CACHE_VERSION, "symbols": config.market.symbols, "timeframe": config.market.timeframe,
+            "start": period.start.isoformat(), "end": period.end.isoformat(),
+            "candle_start": candle_start.isoformat(), "funding_sha256": digest,
+        })
+        load_history(directory, config)
+        directory.rename(destination)
+    return destination
+
+
+def download_history(config: Config, period: Period, progress: Progress = print) -> History:
+    config.validate()
+    period.validate()
+    start = period.start - config.strategy.warmup_hours * HOUR
+    if config.market.cache_enabled:
+        for cached in discover_cache(config, progress):
+            if (
+                cached.period.start <= period.start and cached.period.end >= period.end
+                and cached.candle_start <= start and (cached.has_funding or not config.account.funding_enabled)
+            ):
+                try:
+                    history = load_history(cached.path, config, period)
+                except DataError as error:
+                    progress(f"Re-downloading after cache validation failed: {error}")
+                else:
+                    progress(f"Using cached market data in {cached.path}.")
+                    return history
+
+    with requests.Session() as session:
+        api = PublicAPI(session, config.market, progress)
+        symbol = config.market.kucoin_futures_symbol
+        progress(f"Downloading KuCoin Futures contract metadata for {symbol}.")
+        raw = api.get(CONTRACT_URL.format(symbol=symbol), {}, kucoin=True)
+        if not isinstance(raw, dict):
+            raise DataError(f"Invalid KuCoin Futures metadata for {symbol}.")
+        Contract.from_metadata(raw, symbol, config.account)
+        metadata = {"fetched_at": pd.Timestamp.now(tz="UTC").isoformat(), "exchange_metadata": raw}
+        candles = {
+            market: download_candles(api, market, market_symbol, start, period.end)
+            for market, market_symbol in config.market.symbols.items()
+        }
+        funding = None
+        if config.account.funding_enabled:
+            funding = download_funding(api, symbol, period, config.account.max_funding_gap_hours)
+    destination = save_history(config, period, start, candles, funding, metadata)
+    progress(f"Saved market data in {destination}.")
+    return load_history(destination, config)
