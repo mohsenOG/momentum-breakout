@@ -12,7 +12,7 @@ from plotly.offline import get_plotlyjs
 
 from .backtest import Signal, StrategyResult, Trade
 from .config_test import Config, STRATEGY_NAMES
-from .market_data import History, HOUR, write_json
+from .market_data import FIVE_MINUTES, HOUR, History, write_json
 
 
 METRICS = (
@@ -37,6 +37,8 @@ METRICS = (
     ("average_net_pnl", "Average net P&L per completed trade", "money"),
     ("long_trades", "Long entries", "integer"),
     ("short_trades", "Short entries", "integer"),
+    ("long_net_pnl", "Net P&L from completed Long trades", "money"),
+    ("short_net_pnl", "Net P&L from completed Short trades", "money"),
     ("open_trades", "Open trades at end", "integer"),
     ("max_open_trades", "Maximum simultaneous trades", "integer"),
     ("max_margin_usdt", "Maximum initial margin used", "money"),
@@ -82,6 +84,8 @@ def summarize(config: Config, result: StrategyResult) -> dict:
         "average_net_pnl": sum(trade.net_pnl for trade in closed) / len(closed) if closed else None,
         "long_trades": sum(trade.side == "Long" for trade in trades),
         "short_trades": sum(trade.side == "Short" for trade in trades),
+        "long_net_pnl": sum(trade.net_pnl for trade in closed if trade.side == "Long"),
+        "short_net_pnl": sum(trade.net_pnl for trade in closed if trade.side == "Short"),
         "open_trades": int(last.open_trades),
         "max_open_trades": result.max_open_trades,
         "max_margin_usdt": result.max_margin_usdt,
@@ -166,11 +170,14 @@ def render_html(
     )
     settings = {
         "Trading period (UTC)": f"{history.period.start.date()} to {history.period.last_date}",
-        "Cached candle range (UTC)": (
-            f"{utc(history.cached_candle_start)} to {utc(history.cached_period.end - HOUR)}"
+        "Cached 5m range (UTC)": (
+            f"{utc(history.cached_candle_start)} to {utc(history.cached_period.end - FIVE_MINUTES)}"
         ),
-        "First candle used (UTC)": utc(history.candles["kucoin_futures"].index[0]),
-        "Candle interval": config.market.timeframe.upper(),
+        "Cached 1h range (UTC)": (
+            f"{utc(history.cached_hourly_start)} to {utc(history.cached_period.end.floor(HOUR) - HOUR)}"
+        ),
+        "Signals and fills": config.market.timeframe.upper(),
+        "Levels and ATR": config.market.indicator_timeframe.upper(),
         "Position mode": "Cross Margin · Hedge Mode",
         "Leverage": f"{account.leverage:g}×",
         "Position sizing": sizing,
@@ -224,9 +231,11 @@ def save_results(
             "configuration": asdict(config),
             "period_start_utc": history.period.start.isoformat(),
             "period_end_exclusive_utc": history.period.end.isoformat(),
-            "first_candle_utc": history.candles["kucoin_futures"].index[0].isoformat(),
+            "first_candle_utc": history.candles["kucoin_futures", config.market.timeframe].index[0].isoformat(),
+            "first_hourly_candle_utc": history.candles["kucoin_futures", config.market.indicator_timeframe].index[0].isoformat(),
             "history_directory": str(history.source),
             "cache_first_candle_utc": history.cached_candle_start.isoformat(),
+            "cache_first_hourly_candle_utc": history.cached_hourly_start.isoformat(),
             "cache_end_exclusive_utc": history.cached_period.end.isoformat(),
             "contract_metadata_fetched_utc": history.metadata_fetched_at,
             "effective_contract": asdict(history.contract),

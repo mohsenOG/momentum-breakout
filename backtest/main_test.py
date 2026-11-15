@@ -9,7 +9,7 @@ if __name__ == "__main__" and not __package__:
 
 from .backtest import simulate
 from .config_test import CONFIG, Config, STRATEGY_NAMES
-from .market_data import History, HOUR, Period, discover_cache, download_history, load_history
+from .market_data import FIVE_MINUTES, History, HOUR, Period, discover_cache, download_history, load_history
 from .report import save_results
 
 
@@ -32,14 +32,15 @@ def run_backtest(config: Config, history: History):
 def select_history(config: Config) -> History | None:
     choices = discover_cache(config)
     if not choices:
-        print(f"No compatible cached periods under {config.market.data_directory}.")
+        print(f"No complete 5m cache found under {config.market.data_directory}. Use option 1 to download missing data.")
         return None
     print("\nCached UTC periods")
     for number, choice in enumerate(choices, start=1):
-        warmup = (choice.period.start - choice.candle_start) // HOUR
-        funding = "funding available" if choice.has_funding else "no funding"
+        signal_warmup = (choice.period.start - choice.candle_start) // FIVE_MINUTES
+        hourly_warmup = (choice.period.start.floor(HOUR) - choice.hourly_start) // HOUR
+        funding = "funding available" if choice.funding_digest else "no funding"
         print(f"  {number}. {choice.period.start.date()} through {choice.period.last_date} "
-              f"({warmup} warm-up hours, {funding}, {choice.path.name})")
+              f"({signal_warmup} × 5m and {hourly_warmup} × 1h warm-up candles, {funding}, {choice.path.name})")
     selection = input("Period number (0 to cancel): ").strip()
     if selection == "0":
         return None
@@ -58,14 +59,15 @@ def main(config: Config = CONFIG) -> int:
     while True:
         print(
             f"\nMOMENTUM BREAKOUT BACKTEST\n\nSymbol: {market.symbol}\n"
-            f"Timeframe: {market.timeframe.upper()}\nExecution: KuCoin Futures\n\n"
+            f"Levels and ATR: {market.indicator_timeframe.upper()}\n"
+            f"Signals and execution: {market.timeframe.upper()} (KuCoin Futures fills)\n\n"
             "1. Download new historical data\n"
             "2. Use previously downloaded historical data\n"
-            "0. Exit"
+            "3. Exit"
         )
         try:
             choice = input("\nSelect an option: ").strip()
-            if choice == "0":
+            if choice == "3":
                 return 0
             if choice == "1":
                 first = input("Start date (YYYY-MM-DD UTC): ").strip()
@@ -74,7 +76,7 @@ def main(config: Config = CONFIG) -> int:
             elif choice == "2":
                 history = select_history(config)
             else:
-                print("Choose 0, 1, or 2.")
+                print("Choose 1, 2, or 3.")
                 continue
             if history is not None:
                 run_backtest(config, history)

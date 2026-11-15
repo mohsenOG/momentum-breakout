@@ -17,7 +17,8 @@ STRATEGY_NAMES = {
 @dataclass(frozen=True)
 class MarketSettings:
     symbol: str = "BTC/USDT"
-    timeframe: str = "1h"
+    timeframe: str = "5m"
+    indicator_timeframe: str = "1h"
     binance_spot_symbol: str = "BTCUSDT"
     binance_futures_symbol: str = "BTCUSDT"
     kucoin_spot_symbol: str = "BTC-USDT"
@@ -60,7 +61,8 @@ class StrategySettings:
 
     @property
     def warmup_hours(self) -> int:
-        return max(self.breakout_lookback, self.volume_lookback, self.atr_period)
+        # The first true range needs the preceding hourly close.
+        return max(self.breakout_lookback, self.atr_period + 1)
 
 
 @dataclass(frozen=True)
@@ -116,8 +118,8 @@ class Config:
             for name in names:
                 if type(getattr(group, name)) is not bool:
                     raise ValueError(f"{name} must be True or False.")
-        if market.timeframe != "1h":
-            raise ValueError("Only the 1h timeframe is supported.")
+        if (market.timeframe, market.indicator_timeframe) != ("5m", "1h"):
+            raise ValueError("Signals and execution require 5m candles. Levels and ATR require 1h candles.")
         if not market.symbol.strip() or any(
             not re.fullmatch(r"[A-Z0-9-]+", symbol) for symbol in market.symbols.values()
         ):

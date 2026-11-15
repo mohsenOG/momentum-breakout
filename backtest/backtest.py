@@ -7,7 +7,7 @@ from math import isfinite
 import pandas as pd
 
 from .config_test import AccountSettings, Config
-from .market_data import Contract, History, HOUR, Progress
+from .market_data import Contract, FIVE_MINUTES, History, HOUR, Progress
 
 
 @dataclass
@@ -312,39 +312,47 @@ def reject(signal: Signal, reason: str) -> None:
 
 def indicators(config: Config, history: History) -> tuple[pd.DataFrame, pd.DataFrame]:
     settings = config.strategy
-    reference = history.candles["binance_spot"]
-    futures = history.candles["kucoin_futures"]
-    body_high = reference[["open", "close"]].max(axis=1).shift().rolling(settings.breakout_lookback)
-    body_low = reference[["open", "close"]].min(axis=1).shift().rolling(settings.breakout_lookback)
-    previous_futures_close = futures["close"].shift()
+    market = config.market
+    reference = history.candles["binance_spot", market.timeframe]
+    hourly_reference = history.candles["binance_spot", market.indicator_timeframe]
+    hourly_futures = history.candles["kucoin_futures", market.indicator_timeframe]
+    body_high = hourly_reference[["open", "close"]].max(axis=1).rolling(settings.breakout_lookback)
+    body_low = hourly_reference[["open", "close"]].min(axis=1).rolling(settings.breakout_lookback)
+    previous_futures_close = hourly_futures["close"].shift()
     true_range = pd.concat([
-        futures["high"] - futures["low"],
-        (futures["high"] - previous_futures_close).abs(),
-        (futures["low"] - previous_futures_close).abs(),
+        hourly_futures["high"] - hourly_futures["low"],
+        (hourly_futures["high"] - previous_futures_close).abs(),
+        (hourly_futures["low"] - previous_futures_close).abs(),
     ], axis=1).max(axis=1, skipna=False)
+    hourly_atr = true_range.rolling(settings.atr_period).mean()
+    hourly_atr.index += HOUR
+    # Entries and trailing-stop updates use the ATR available at the 5m close.
+    atr = hourly_atr.reindex(reference.index + FIVE_MINUTES, method="ffill").set_axis(reference.index)
     common = pd.DataFrame({
         "reference_close": reference["close"],
         "previous_reference_close": reference["close"].shift(),
-        "atr": true_range.rolling(settings.atr_period).mean(),
+        "atr": atr,
     })
-    for market, candles in history.candles.items():
-        volume = candles["volume"]
+    for name in market.symbols:
+        volume = history.candles[name, market.timeframe]["volume"]
         average = volume.shift().rolling(settings.volume_lookback).mean()
-        common[f"{market}_volume_ratio"] = volume / average.where(average > 0)
-    levels = pd.DataFrame(index=reference.index)
+        common[f"{name}_volume_ratio"] = volume / average.where(average > 0)
+    levels = pd.DataFrame(index=hourly_reference.index)
     if "body_extremes" in settings.selected:
         levels["body_extremes_resistance"] = body_high.max()
         levels["body_extremes_support"] = body_low.min()
     if "body_quantiles" in settings.selected:
         levels["body_quantiles_resistance"] = body_high.quantile(settings.upper_quantile, interpolation="linear")
         levels["body_quantiles_support"] = body_low.quantile(settings.lower_quantile, interpolation="linear")
-    return common, levels
+    # Keep the level active at each 5m candle's open for both prices in the crossing.
+    levels.index += HOUR
+    return common, levels.reindex(reference.index, method="ffill")
 
 
 def simulate(config: Config, history: History, progress: Progress = print) -> list[StrategyResult]:
     config.validate()
     common, levels = indicators(config, history)
-    candles = history.candles["kucoin_futures"].join(common).join(levels)
+    candles = history.candles["kucoin_futures", config.market.timeframe].join(common).join(levels)
     candles = candles.loc[(candles.index >= history.period.start) & (candles.index < history.period.end)]
     return [simulate_strategy(config, history, strategy, candles, progress) for strategy in config.strategy.selected]
 
@@ -362,9 +370,9 @@ def simulate_strategy(
         "timestamp_utc": history.period.start, **vars(account.value(float(candles["open"].iloc[0]))),
         "open_trades": 0,
     }]
-    progress(f"Simulating {strategy} over {len(candles):,} hourly candles.")
+    progress(f"Simulating {strategy} over {len(candles):,} five-minute candles.")
     for index, row in enumerate(candles.itertuples(), start=1):
-        start, end = row.Index, row.Index + HOUR
+        start, end = row.Index, row.Index + FIVE_MINUTES
         if settlement and settlement[0] == start:
             account.settle_funding(row.open, settlement[1])
             settlement = next(rates, None)
