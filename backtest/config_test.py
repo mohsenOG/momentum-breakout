@@ -30,6 +30,7 @@ class MarketSettings:
     retry_backoff: float = 1.0
     retry_max_delay: float = 30.0
     cache_enabled: bool = True
+    max_kucoin_futures_5m_gap_candles: int = 5  # Consecutive missing candles. Zero disables filling.
 
     @property
     def symbols(self) -> dict[str, str]:
@@ -133,6 +134,7 @@ class Config:
 
         for name, value, minimum in (
             ("retry_count", market.retry_count, 0),
+            ("max_kucoin_futures_5m_gap_candles", market.max_kucoin_futures_5m_gap_candles, 0),
             ("breakout_lookback", strategy.breakout_lookback, 1),
             ("volume_lookback", strategy.volume_lookback, 1),
             ("atr_period", strategy.atr_period, 1),

@@ -374,6 +374,20 @@ def recover_kucoin_futures_5m(
     return frame
 
 
+def bounded_kucoin_5m_gaps(
+    expected: pd.DatetimeIndex, frame: pd.DataFrame, symbol: str, limit: int,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    gaps = list(missing_ranges(expected.difference(frame.index), FIVE_MINUTES))
+    for start, end in gaps:
+        count = (end - start) // FIVE_MINUTES
+        if count > limit:
+            raise DataError(
+                f"KuCoin Futures {symbol} 5m: {count} missing candles from {start} "
+                f"through {end - FIVE_MINUTES} exceeds the forward-fill limit of {limit}."
+            )
+    return gaps
+
+
 def save_candle_page(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".page-", dir=path.parent) as staging:
@@ -385,6 +399,7 @@ def save_candle_page(path: Path, frame: pd.DataFrame) -> None:
 def download_candles(
     api: PublicAPI, market: str, symbol: str, start: pd.Timestamp, end: pd.Timestamp, timeframe: str,
 ) -> pd.DataFrame:
+    """Download source candles. Join KuCoin 5m pages before filling gaps."""
     url, limit, unit, fetch = MARKETS[market]
     step = INTERVALS[timeframe]
     source = f"{market} {symbol} {timeframe}"
@@ -435,6 +450,10 @@ def download_candles(
             frame = recover_kucoin_futures_5m(api, symbol, frame, expected, fetch_frame)
             if api.settings.cache_enabled and original_count < len(frame) < len(expected):
                 save_candle_page(partial, frame)
+            if len(frame) < len(expected):
+                bounded_kucoin_5m_gaps(expected, frame, symbol, api.settings.max_kucoin_futures_5m_gap_candles)
+                parts.append(frame)
+                continue
         page = validate_candles(frame, first, stop, source, step)
         if api.settings.cache_enabled and not complete_from_cache:
             save_candle_page(path, page)
@@ -675,7 +694,27 @@ def reuse_candles(
         if not remaining:
             break
     parts.extend(download_candles(api, market, symbol, first, stop, timeframe) for first, stop in remaining)
-    return pd.concat(parts).sort_index()
+    frame = pd.concat(parts).sort_index()
+    if market == "kucoin_futures" and timeframe == "5m":
+        expected = pd.date_range(start, end, freq=step, inclusive="left", name="timestamp_utc")
+        limit = api.settings.max_kucoin_futures_5m_gap_candles
+        gaps = bounded_kucoin_5m_gaps(expected, frame, symbol, limit)
+        if gaps:
+            if gaps[0][0] == start:
+                earlier = download_candles(api, market, symbol, start - limit * step, start, timeframe)
+                if earlier.empty:
+                    raise DataError(f"KuCoin Futures {symbol} 5m: no previous close within the fill limit at {start}.")
+                anchor = earlier.tail(1)
+                frame = pd.concat((anchor, frame))
+                expected = pd.date_range(anchor.index[0], end, freq=step, inclusive="left", name="timestamp_utc")
+                gaps = bounded_kucoin_5m_gaps(expected, frame, symbol, limit)
+            frame = frame.reindex(expected)
+            for first, stop in gaps:
+                close = frame.at[first - step, "close"]
+                frame.loc[first:stop - step, list(CANDLE_COLUMNS)] = [close, close, close, close, 0.0]
+                api.progress(f"Forward-filled KuCoin Futures {symbol} 5m from {max(start, first)} through {stop - step}.")
+            frame = frame.loc[start:]
+    return frame
 
 
 def download_history(config: Config, period: Period, progress: Progress = print) -> History:
